@@ -1,0 +1,27 @@
+# Training hyperparameters for VisDrone human/car detection.
+# Tuned for aerial imagery: many tiny, densely packed objects.
+
+model: yolo11s.pt        # seed weights; yolo11n=fast, yolo11m/l=stronger (cluster)
+data: data/visdrone/visdrone.yaml
+
+epochs: 100
+imgsz: 1024              # high res is critical -- VisDrone objects are tiny
+batch: 16                # lower if you hit OOM on the cluster GPU
+patience: 25             # early-stop if val mAP plateaus
+
+optimizer: auto
+lr0: 0.01
+cos_lr: true
+weight_decay: 0.0005
+warmup_epochs: 3
+
+# Augmentation -- mosaic helps small-object density; closed near the end
+mosaic: 1.0
+close_mosaic: 10
+scale: 0.5
+fliplr: 0.5
+hsv_v: 0.4
+
+project: runs/detect
+name: visdrone_yolo11s
+exist_ok: false

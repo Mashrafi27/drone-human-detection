@@ -1,0 +1,154 @@
+"""Convert VisDrone-DET annotations to Ultralytics YOLO format.
+
+VisDrone annotation line (one object per line, CSV):
+    <bbox_left>,<bbox_top>,<bbox_w>,<bbox_h>,<score>,<category>,<truncation>,<occlusion>
+
+VisDrone categories:
+    0 ignored  1 pedestrian  2 people  3 bicycle  4 car  5 van
+    6 truck    7 tricycle    8 awning-tricycle    9 bus  10 motor  11 others
+
+The assessment only needs HUMANS and CARS, so we remap to 2 classes:
+    class 0 = human   <- pedestrian(1), people(2)
+    class 1 = car     <- car(4)
+
+`--vehicle-mode broad` additionally folds van(5), truck(6), bus(9) into the
+car/vehicle class -- useful because from an aerial view these are easily
+confused with cars; keep the default (`car`) to match the task literally.
+
+YOLO box format (normalized, per line): <cls> <cx> <cy> <w> <h>
+Rows with score==0 are VisDrone "ignored" boxes and are dropped.
+"""
+import argparse
+from pathlib import Path
+
+from PIL import Image
+from tqdm import tqdm
+
+# VisDrone category id -> our class id
+BASE_MAP = {1: 0, 2: 0, 4: 1}                       # human, human, car
+BROAD_EXTRA = {5: 1, 6: 1, 9: 1}                    # van/truck/bus -> vehicle
+
+CLASS_NAMES = ["human", "car"]
+
+# Split-folder name fragments -> YOLO split name
+SPLIT_KEYS = {
+    "train": "train",
+    "val": "val",
+    "test-dev": "test",
+    "test": "test",
+}
+
+
+def find_split_dirs(src: Path) -> dict[str, Path]:
+    """Locate the VisDrone-DET-{train,val,test} dirs anywhere under `src`."""
+    found: dict[str, Path] = {}
+    for p in src.rglob("*"):
+        if not p.is_dir():
+            continue
+        if not ((p / "images").is_dir() and (p / "annotations").is_dir()):
+            continue
+        name = p.name.lower()
+        for frag, split in SPLIT_KEYS.items():
+            if frag in name and split not in found:
+                found[split] = p
+    return found
+
+
+def convert_split(split_dir: Path, out_root: Path, split: str, cmap: dict[int, int]) -> tuple[int, int]:
+    img_out = out_root / "images" / split
+    lbl_out = out_root / "labels" / split
+    img_out.mkdir(parents=True, exist_ok=True)
+    lbl_out.mkdir(parents=True, exist_ok=True)
+
+    ann_dir = split_dir / "annotations"
+    img_dir = split_dir / "images"
+    images = sorted(img_dir.glob("*.jpg")) + sorted(img_dir.glob("*.png"))
+
+    n_imgs, n_boxes = 0, 0
+    for img_path in tqdm(images, desc=f"{split:5s}"):
+        ann_path = ann_dir / f"{img_path.stem}.txt"
+        if not ann_path.exists():
+            continue
+        with Image.open(img_path) as im:
+            W, H = im.size
+
+        lines = []
+        for raw in ann_path.read_text().splitlines():
+            raw = raw.strip().rstrip(",")
+            if not raw:
+                continue
+            f = raw.split(",")
+            x, y, w, h = map(float, f[:4])
+            score, cat = int(float(f[4])), int(float(f[5]))
+            if score == 0 or cat not in cmap or w <= 0 or h <= 0:
+                continue
+            cls = cmap[cat]
+            cx = (x + w / 2) / W
+            cy = (y + h / 2) / H
+            nw, nh = w / W, h / H
+            # clip to [0,1] for boxes that slightly exceed image bounds
+            cx, cy = min(max(cx, 0), 1), min(max(cy, 0), 1)
+            nw, nh = min(nw, 1), min(nh, 1)
+            lines.append(f"{cls} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+
+        # Symlink image (saves disk; falls back to copy on failure)
+        dst_img = img_out / img_path.name
+        if not dst_img.exists():
+            try:
+                dst_img.symlink_to(img_path.resolve())
+            except OSError:
+                import shutil
+                shutil.copy2(img_path, dst_img)
+        (lbl_out / f"{img_path.stem}.txt").write_text("\n".join(lines))
+        n_imgs += 1
+        n_boxes += len(lines)
+    return n_imgs, n_boxes
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="VisDrone -> YOLO converter")
+    ap.add_argument("--src", default="data/raw", help="Folder containing VisDrone2019-DET-* dirs")
+    ap.add_argument("--dst", default="data/visdrone", help="Output YOLO dataset root")
+    ap.add_argument("--vehicle-mode", choices=["car", "broad"], default="car",
+                    help="'car' = only category 4; 'broad' = also van/truck/bus")
+    args = ap.parse_args()
+
+    src, dst = Path(args.src), Path(args.dst)
+    cmap = dict(BASE_MAP)
+    if args.vehicle_mode == "broad":
+        cmap.update(BROAD_EXTRA)
+
+    splits = find_split_dirs(src)
+    if not splits:
+        raise SystemExit(
+            f"No VisDrone split folders found under {src}. "
+            "Run scripts/download_data.py first."
+        )
+    print("Found splits:", {k: str(v) for k, v in splits.items()})
+
+    totals = {}
+    for split, sdir in splits.items():
+        totals[split] = convert_split(sdir, dst, split, cmap)
+
+    # Write the Ultralytics dataset config.
+    yaml_path = dst / "visdrone.yaml"
+    has_val = "val" in splits
+    yaml_path.write_text(
+        f"# Auto-generated by scripts/convert_visdrone.py\n"
+        f"path: {dst.resolve()}\n"
+        f"train: images/train\n"
+        f"val: images/{'val' if has_val else 'train'}\n"
+        + ("test: images/test\n" if "test" in splits else "")
+        + f"nc: {len(CLASS_NAMES)}\n"
+        f"names: {CLASS_NAMES}\n"
+    )
+
+    print("\nConversion summary (images, boxes):")
+    for split, (ni, nb) in totals.items():
+        print(f"  {split:5s}: {ni:6d} images, {nb:8d} boxes")
+    print(f"\nDataset config written to: {yaml_path}")
+    print("Next: python src/train.py --data", yaml_path)
+
+
+if __name__ == "__main__":
+    main()
